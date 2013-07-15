@@ -8,78 +8,30 @@ import java.lang.annotation.Target;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
+import java.util.Map.Entry;
 import java.util.SortedMap;
-import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
-import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.TimeUnit;
 
-import javax.annotation.Nullable;
-
 import org.apache.log4j.Logger;
-import org.ketan.cascade.Cascade.Collaboration;
-import org.ketan.cascade.Cascade.CollaborationTarget;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
 
-public class Cascade {
+public class Cascade implements Publisher {
+    private static final String RESULT_PUBLISHER = "publisher";
+    private static final String RESULT_ID = "id";
     //  TODO: logging should be per-instance
     private static final Logger LOGGER = Logger.getLogger(Cascade.class);
 
-    class Result<C> {
-        private final Class<C> outputClass;
-        //  gotta make sure all code interacting with this can be null
-        private final C output;
-        private final String name;
-
-        public Result(final Class<C> outputClass, final C output, final String name) {
-            super();
-            this.outputClass = outputClass;
-            this.output = output;
-            this.name = name;
-        }
-
-        public Class<C> getResultClass() {
-            return outputClass;
-        }
-
-        public C getOutput() {
-            return output;
-        }
-
-        public String getName() {
-            return name;
-        }
-    }
-
     class SomeCollab {
-        @Output(name="z") String doStuff(Cascade c, @Input(timeout=20, name="y") String y) {
+        @Output(name="z") String doStuff(Publisher c, @Input(timeout=20, name="y") String y) {
             return "zorblox";
-        }
-    }
-
-    class Invocation {
-        private final Method method;
-        private final Object[] arguments;
-
-        public Invocation(final Method method, final Object[] arguments) {
-            this.method = method;
-            this.arguments = arguments;
-        }
-
-        public Method getMethod() {
-            return method;
-        }
-
-        public Object[] getArguments() {
-            return arguments;
         }
     }
 
@@ -120,10 +72,6 @@ public class Cascade {
     @Target(ElementType.METHOD)
     @interface FallbackMethod {
         //  intentionally empty
-    }
-
-    interface Publisher {
-        void publish(Object collaborator, Class<?> outputClass, String name, Object output);
     }
 
     class Collaboration {
@@ -212,10 +160,10 @@ public class Cascade {
      * TODO: hard limit on when collaborators can be initiated, even if they are executeAfterTimeout (how to set?  per collaborator?  request global?)
      */
 
-    class CollaborationTarget {
+    class CollaboratorParameter {
         private final Collaboration collaboration;
         private final int parameterIndex;
-        public CollaborationTarget(Collaboration collaboration, int parameterIndex) {
+        public CollaboratorParameter(Collaboration collaboration, int parameterIndex) {
             this.collaboration = collaboration;
             this.parameterIndex = parameterIndex;
         }
@@ -232,26 +180,25 @@ public class Cascade {
     private final long startTime;
     private final long finishBy;
 
-    final Map<String, List<CollaborationTarget>> collaborationNeedsByName = Maps.newHashMap();
-    final Map<Class<?>, List<CollaborationTarget>> collaborationNeedsByType = Maps.newHashMap();
+    private final Map<String, List<CollaboratorParameter>> collaborationNeedsByName = Maps.newHashMap();
+    private final Map<Class<?>, List<CollaboratorParameter>> collaborationNeedsByType = Maps.newHashMap();
     //  TODO: will need to remove collaborations from this when the timeout-annotated dependency is satisfied
-    final SortedMap<Long, List<CollaborationTarget>> collaborationsByTimeDue = Maps.newTreeMap();
+    private final SortedMap<Long, List<Collaboration>> collaborationsByTimeDue = Maps.newTreeMap();
 
-    final Map<String, Result<?>> resultsByName = Maps.newHashMap();
-    final Map<Class<?>, Result<?>> resultsByType = Maps.newHashMap();
-
-    final CountDownLatch incompleteCollaborations;
+    private final CountDownLatch incompleteCollaborations;
 
     private final Results results = new Results();
 
     private final Executor executor;
 
-    public Cascade(final long startTime, final long finishBy, final Executor executor, final Collection<Object> allCollaborators) {
+    public Cascade(final long startTime, final long finishBy, final Executor executor, final Collection<Object> allCollaborators, final String id) {
         this.startTime = startTime;
         this.finishBy = finishBy;
         this.executor = executor;
         this.incompleteCollaborations = new CountDownLatch(allCollaborators.size());
         this.setUpCollaborators(allCollaborators, startTime);
+        publish(this, String.class, RESULT_ID, id);
+        publish(this, Publisher.class, RESULT_PUBLISHER, this); //  needed if anything is going to publish
     }
 
     private synchronized void setUpCollaborators(final Collection<Object> allCollaborators, final long startTime) {
@@ -265,8 +212,8 @@ public class Cascade {
             final Class<?>[] parameterTypes = method.getParameterTypes();
 
             for (int i = 0; i < parameterAnnotations.length; i++) {
-                final CollaborationTarget target = new CollaborationTarget(collaboration, i);
-                List<CollaborationTarget> collaborationNeedsForType = collaborationNeedsByType.get(parameterTypes[i]);
+                final CollaboratorParameter target = new CollaboratorParameter(collaboration, i);
+                List<CollaboratorParameter> collaborationNeedsForType = collaborationNeedsByType.get(parameterTypes[i]);
                 if (collaborationNeedsForType == null) {
                     collaborationNeedsForType = Lists.newArrayList();
                     collaborationNeedsByType.put(parameterTypes[i], collaborationNeedsForType);
@@ -278,24 +225,23 @@ public class Cascade {
                         final Input input = (Input) parameterAnnotations[i][j];
 
                         if (input.name() != null) { //  TODO: also !empty
-                            List<CollaborationTarget> collaborationNeedsForName = collaborationNeedsByName.get(input.name());
+                            List<CollaboratorParameter> collaborationNeedsForName = collaborationNeedsByName.get(input.name());
                             if (collaborationNeedsForName == null) {
                                 collaborationNeedsForName = Lists.newArrayList();
                                 collaborationNeedsByName.put(input.name(), collaborationNeedsForName);
                             }
                             collaborationNeedsForName.add(target);
                         }
-
-                        final long inputTimeout = (input.timeout() + startTime);
-                        List<CollaborationTarget> collaborationsAtTheSameTime = collaborationsByTimeDue.get(inputTimeout);
-                        if (collaborationsAtTheSameTime == null) {
-                            collaborationsAtTheSameTime = Lists.newArrayList();
-                            collaborationsByTimeDue.put(inputTimeout, collaborationsAtTheSameTime);
-                        }
-                        collaborationsAtTheSameTime.add(target);
                     }
                 }
             }
+
+            List<Collaboration> collaborationsAtTheSameTime = collaborationsByTimeDue.get(deadline);
+            if (collaborationsAtTheSameTime == null) {
+                collaborationsAtTheSameTime = Lists.newArrayList();
+                collaborationsByTimeDue.put(deadline, collaborationsAtTheSameTime);
+            }
+            collaborationsAtTheSameTime.add(collaboration);
         }
     }
 
@@ -352,18 +298,27 @@ public class Cascade {
                 if (finishBy <= now) {  //  if we've run out of time to do anything, quit
                     break;
                 }
-                if (firstDue != null) {
-                    synchronized (this) {
-                        final List<CollaborationTarget> collaborations = collaborationsByTimeDue.remove(firstDue);
-                        
-                        for (final CollaborationTarget collaborationTarget : collaborations) {
-                            //  TODO: review each parameter
-                            final Collaboration collaboration = collaborationTarget.getCollaboration();
-                            if (collaboration.getDeadline() <= now) {
-                                invoke(collaboration);;
-                            }
-                        }
+
+                //  dispatch everything that is due or overdue
+                final List<Collaboration> readyToGo;
+                synchronized (this) {
+                    if (collaborationsByTimeDue.isEmpty()) {
+                        continue;
                     }
+                    readyToGo = Lists.newArrayList();
+                    for (final Iterator<Entry<Long, List<Collaboration>>> iterator = collaborationsByTimeDue.entrySet().iterator();
+                            iterator.hasNext(); ) {
+                        final Entry<Long, List<Collaboration>> entry = iterator.next();
+                        if (entry.getKey() > now) {
+                            break;
+                        }
+                        readyToGo.addAll(entry.getValue());
+                        iterator.remove();
+                    }
+                }
+
+                for (final Collaboration collaboration : readyToGo) {
+                    invoke(collaboration);
                 }
             } catch (InterruptedException e) {
                 // TODO
@@ -373,17 +328,10 @@ public class Cascade {
     }
 
 
-    Long getMinimumWait() {
-        if (collaborationsByTimeDue.isEmpty()) {
-            return null;
-        }
-        return collaborationsByTimeDue.firstKey();
-    }
-
-    void publish(final Object collaborator, final Class<?> outputClass, final String name, final Object output) {
+    public void publish(final Object collaborator, final Class<?> outputClass, final String name, final Object output) {
         //  TODO: log that this was produced by collaborator
  
-        final List<CollaborationTarget> collaborationTargets;
+        final List<CollaboratorParameter> collaborationTargets;
         synchronized (this) {
             if (name == null) {
                 collaborationTargets = collaborationNeedsByType.remove(outputClass);
@@ -404,147 +352,14 @@ public class Cascade {
             return;
         }
 
-        for (final Iterator<CollaborationTarget> iterator = collaborationTargets.iterator(); iterator.hasNext();) {
-            final CollaborationTarget target = iterator.next();
+        for (final Iterator<CollaboratorParameter> iterator = collaborationTargets.iterator(); iterator.hasNext();) {
+            final CollaboratorParameter target = iterator.next();
             final Collaboration collaboration = target.getCollaboration();
             collaboration.resolveParameter(target.getParameterIndex(), output);
             if (collaboration.allResolved()) {
                 invoke(collaboration);
             }
         }
-    }
-
-    public void start(final Executor executor, final Collection<Object> allCollaborators, final long startTime, final long finishBy) {
-        executor.execute(new Runnable() {
-            public void run() {
-                // TODO: look through collaborators to ensure that each one has exactly one applicable method
-                final List<Collaboration> collaborations = Lists.newArrayListWithCapacity(allCollaborators.size());
-                for (final Object collaborator : allCollaborators) {
-                    final Method[] methods = collaborator.getClass().getMethods();
-                    Method found = findCollaborationMethod(methods);
-                    if (found == null) {
-                        // TODO: error
-                    }
-                    collaborations.add(new Collaboration(collaborator, found, 0));
-                }
-
-                final BlockingQueue<Result<?>> resultQueue = new LinkedBlockingDeque<Result<?>>(20);
-                final Publisher publisher = new Publisher() {
-                    // @Override
-                    public void publish(final Object collaborator, final Class<?> outputClass, final String name, final Object output) {
-                        // TODO: log the result
-                        final Result<?> result = new Result(outputClass, output, name);
-                        try {
-                            resultQueue.put(result);
-                        } catch (final InterruptedException e) {
-                            LOGGER.error("Interrupted while putting result", e);
-                        }
-                    }
-                };
-
-                final List<Result<?>> results = Lists.newArrayListWithCapacity(10);
-                results.add(new Result(Cascade.class, this, null));
-
-                long timeToNext = 0;
-
-                while (true) {
-                    try {
-                        if (timeToNext < 0) {
-                            timeToNext = 0;
-                        }
-                        Result<?> result = resultQueue.poll(timeToNext, TimeUnit.MILLISECONDS);
-                        if (result != null) {
-                            results.add(result);
-                            resultQueue.drainTo(results);
-                        }
-                    } catch (final InterruptedException e) {
-                        // TODO
-                    }
-
-                    final long now = clock();
-                    for (int i = 0; i < collaborations.size();) {
-                        final Collaboration collaboration = collaborations.get(i);
-                        final Object collaborator = collaboration.getCollaborator();
-                        Invocation invocation = null;
-                        final Method method = collaboration.getMethod();
-                        final Class<?>[] parameterTypes = method.getParameterTypes();
-
-                        final Result<?>[] matches = new Result[parameterTypes.length - 1];
-                        for (int j = 0; j < parameterTypes.length; j++) {
-                            final Annotation[][] parameterAnnotations = method.getParameterAnnotations();
-                            @Nullable
-                            Input annotation = null;
-                            for (int k = 0; k < parameterAnnotations[j].length; k++) {
-                                if (Input.class.equals(parameterAnnotations[j][k].annotationType())) {
-                                    annotation = (Input) parameterAnnotations[j][k];
-                                    break;
-                                }
-                            }
-                            boolean satisfied = false;
-
-                            for (final Result<?> result : results) {
-                                if (parameterTypes[j].isAssignableFrom(result.getClass())) {
-                                    if ((annotation == null) || (annotation.name() == null) || (annotation.name().equals(result.getName()))) {
-                                        if (matches[j] == null) {
-                                            matches[j] = result;
-                                            satisfied = true;
-                                        } else {
-                                            // TODO: error; ambiguous
-                                        }
-                                    }
-                                }
-                            }
-                            satisfied = satisfied || ((annotation != null) && (annotation.timeout() + startTime < now)); // will go with null
-                            if (satisfied) {
-                                final Object[] arguments = new Object[parameterTypes.length];
-                                for (int k = 0; k < arguments.length; k++) {
-                                    if (matches[k] == null) {
-                                        arguments[k] = null;
-                                    } else {
-                                        arguments[k] = matches[k].getOutput();
-                                    }
-                                }
-                                invocation = new Invocation(method, arguments);
-                            }
-                        }
-                        if (invocation == null) {
-                            i++;
-                        } else {
-                            collaborations.remove(i);
-
-                            final Output outputAnnotation = invocation.getMethod().getAnnotation(Output.class);
-
-                            if ((finishBy > now) || ((outputAnnotation != null) && outputAnnotation.executeAfterTimeout())) {
-//                                invoke(executor, publisher, invocation.getMethod(), collaborator, invocation.getArguments());
-                            }
-                        }
-                    }
-                    int remainingToDo = 0;
-                    for (final Collaboration collaboration : collaborations) {
-                        Method method = collaboration.getMethod();
-                        final Output outputAnnotation = method.getAnnotation(Output.class);
-                        if ((outputAnnotation != null) && outputAnnotation.executeAfterTimeout()) {
-                            remainingToDo++;
-                        }
-
-                        final Annotation[][] parameterAnnotations = method.getParameterAnnotations();
-                        for (int i = 0; i < parameterAnnotations.length; i++) {
-                            for (int j = 0; j < parameterAnnotations[j].length; j++) {
-                                if (parameterAnnotations[i][j].annotationType().equals(Input.class)) {
-                                    final long requiredBy = startTime + ((Input) parameterAnnotations[i][j]).timeout();
-                                    if (requiredBy < timeToNext) {
-                                        timeToNext = requiredBy;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    if ((finishBy <= now) && (remainingToDo == 0)) {
-                        break;
-                    }
-                }
-            }
-        });
     }
 
     private void invoke(final Collaboration collaboration) {
